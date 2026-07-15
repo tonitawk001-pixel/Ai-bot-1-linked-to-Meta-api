@@ -1,11 +1,14 @@
 """
-V22 Gold Scalping Bot — MetaApi Cloud Edition (FINAL v4.2)
+V22 Gold Scalping Bot — MetaApi Cloud Edition (FINAL v4.3)
 =======================================================
-IMPROVEMENTS (v4.2):
-  1. Dynamic Spread Filter — blocks entry if XAUUSD spread > 30 points ($0.30)
-  2. High-Impact USD News Filter — pauses entries around major news via MetaApi calendar
-  3. Dynamic ADX-based Take Profit — 5x ATR when ADX > 25, else 3.5x ATR
-  4. Detailed Logging — clear [REJECTED] messages with exact reason
+CRITICAL FIXES (v4.3):
+  1. TRUE Dynamic Risk Sizing — 2% flat risk per trade, sent to MetaApi
+  2. LIVE Breakeven via modify_position() — secures profits on MetaApi
+  3. LIVE 5x ATR TP — ADX dynamic TP actually sent to broker orders
+
+BUG FIX: v4.2 calculated SL/TP in memory but NEVER called execute_trade()
+          for strategy trades. Only startup_test/heartbeat placed real orders.
+          Now ALL strategy trades execute real MetaApi orders with proper SL/TP.
 """
 
 import os
@@ -17,7 +20,6 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import numpy as np
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from dotenv import load_dotenv
@@ -30,27 +32,26 @@ from trading_bot.metaapi.data_feed import get_candles
 from trading_bot.indicators.technical_indicators import compute_all_indicators
 from trading_bot.strategy.gold_scalping_strategy import GoldScalpingStrategy
 from trading_bot.strategy.gold_volatility_filter import GoldVolatilityFilter
-from trading_bot.metaapi.executor import execute_trade, close_position
+from trading_bot.metaapi.executor import execute_trade, close_position, modify_position
 
 
 # === V22 CONFIG ===
 SYMBOL = "XAUUSD"
-
-# Strategy filters
 MIN_SCORE = 45
 MAX_POSITIONS = 1
 MIN_ATR = 1.0
-
-# Session filter (UTC hours)
 TRADE_HOURS_START = 8
 TRADE_HOURS_END = 22
 
 # Position management
-TP_ATR_MULT = 3.5      # Default: 3.5x ATR
-TP_ATR_MULT_TREND = 5.0  # Dynamic: 5x ATR when ADX > 25 (strong trend)
+TP_ATR_MULT = 3.5
+TP_ATR_MULT_TREND = 5.0
 SL_ATR_MULT = 1.5
 BE_ATR_MULT = 2.0
 TRAIL_ATR_MULT = 0.7
+
+# v4.3: Flat 2% risk
+RISK_PERCENT_FLAT = 2.0  # Risk 2% of balance per trade
 
 # Risk management
 HALT_AFTER_LOSSES = 3
@@ -58,34 +59,23 @@ HALT_HOURS = 6
 ENTRY_COOLDOWN_MINUTES = 30
 DAILY_LOSS_PCT = 0.03
 
-# Graduated risk
-RISK_PERCENT = {
-    (0, 250): 0.5,
-    (250, 500): 1.5,
-    (500, 1000): 2.5,
-    (1000, float('inf')): 3.0,
-}
+# Graduated risk (v4.3 keeps this for reference but uses flat 2%)
+RISK_PERCENT = {(0, 250): 0.5, (250, 500): 1.5, (500, 1000): 2.5, (1000, float('inf')): 3.0}
 
-# Heartbeat test config
 HEARTBEAT_INTERVAL_MINUTES = 60
 HEARTBEAT_CLOSE_AFTER_SECONDS = 30
-
-# Spread (matches backtest exactly — 0.5 pips)
 BACKTEST_SPREAD_PIPS = 0.50
 
-# === NEW v4.2 CONFIG ===
-# Dynamic Spread Filter (XAUUSD specific)
-MAX_SPREAD_POINTS = 30  # Block if spread > 30 points ($0.30 for XAUUSD)
+# v4.2 config (kept)
+MAX_SPREAD_POINTS = 30
+NEWS_PAUSE_MINUTES_BEFORE = 30
+NEWS_RESUME_MINUTES_AFTER = 15
+NEWS_CACHE_HOURS = 6
+ADX_TREND_THRESHOLD = 25
 
-# News filter config
-NEWS_PAUSE_MINUTES_BEFORE = 30   # Pause 30 min before high-impact event
-NEWS_RESUME_MINUTES_AFTER = 15   # Resume 15 min after event
-NEWS_CACHE_HOURS = 6             # Re-fetch calendar every 6 hours
+# v4.3: Breakeven buffer in points
+BE_BUFFER_POINTS = 12  # 12 points buffer above entry for breakeven
 
-# ADX threshold for dynamic TP
-ADX_TREND_THRESHOLD = 25  # ADX > 25 = strong trend
-
-# State files
 STATE_FILE = os.path.join(os.path.dirname(__file__), "..", "logs", "bot_state.json")
 PAUSE_FILE = os.path.join(os.path.dirname(__file__), "..", "logs", "paused.flag")
 
@@ -93,24 +83,25 @@ PAUSE_FILE = os.path.join(os.path.dirname(__file__), "..", "logs", "paused.flag"
 consecutive_losses = 0
 halt_until = None
 daily_pnl = 0.0
-positions = []
+positions = []          # v4.3: Now tracks LIVE MetaApi positions with real IDs
 last_entry = None
 trades_log = []
 last_heartbeat_time = None
 last_processed_m15_time = None
 startup_test_done = False
 
-# === NEW v4.2 State ===
-last_spread_check = 0.0        # Last spread value logged
-cached_events = []             # Cached economic calendar events
-events_cache_time = None       # When we last fetched events
+# v4.2 State
+last_spread_check = 0.0
+cached_events = []
+events_cache_time = None
+
+# v4.3: Track which positions have been breakeven-modified
+be_modified_ids = set()
 
 
 def get_risk_pct(balance: float) -> float:
-    for (lo, hi), pct in RISK_PERCENT.items():
-        if lo <= balance < hi:
-            return pct
-    return 1.0
+    """v4.3: Always returns 2% flat risk."""
+    return RISK_PERCENT_FLAT / 100.0  # Returns 0.02 for 2%
 
 
 def is_in_trading_session(dt_utc: datetime) -> bool:
@@ -149,7 +140,6 @@ def reset_daily():
 
 
 def save_state():
-    """Save full bot state to survive restarts."""
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         state = {
@@ -160,6 +150,7 @@ def save_state():
             "last_entry": last_entry.isoformat() if last_entry else None,
             "trades_log": trades_log[-200:],
             "last_processed_m15_time": last_processed_m15_time.isoformat() if last_processed_m15_time else None,
+            "be_modified_ids": list(be_modified_ids),
             "updated": datetime.now(timezone.utc).isoformat(),
         }
         with open(STATE_FILE, "w") as f:
@@ -169,8 +160,7 @@ def save_state():
 
 
 def load_state():
-    """Load bot state on startup."""
-    global positions, consecutive_losses, halt_until, daily_pnl, last_entry, last_processed_m15_time, trades_log
+    global positions, consecutive_losses, halt_until, daily_pnl, last_entry, last_processed_m15_time, trades_log, be_modified_ids
     try:
         if not os.path.exists(STATE_FILE):
             return
@@ -186,13 +176,13 @@ def load_state():
         trades_log = state.get("trades_log", [])
         lm = state.get("last_processed_m15_time")
         last_processed_m15_time = datetime.fromisoformat(lm) if lm else None
-        logger.info(f"STATE RESTORED: positions={len(positions)}, consec_losses={consecutive_losses}, last_m15={last_processed_m15_time}")
+        be_modified_ids = set(state.get("be_modified_ids", []))
+        logger.info(f"STATE RESTORED: positions={len(positions)}, BE_ids={len(be_modified_ids)}")
     except Exception as e:
         logger.warning(f"Could not load state: {e}")
 
 
 def write_state_for_dashboard(balance: float, equity: float, status: str, cycle: int):
-    """Export current state to JSON for the web dashboard."""
     try:
         os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
         state = {
@@ -214,60 +204,39 @@ def write_state_for_dashboard(balance: float, equity: float, status: str, cycle:
 
 
 # ============================================================
-# NEW v4.2: ADX Calculation (in-house, no external dep)
+# ADX Calculation
 # ============================================================
 
 def compute_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """Compute Average Directional Index (ADX) for trend strength."""
     if len(close) < period * 2:
         return pd.Series([np.nan] * len(close), index=close.index)
-
-    high = high.astype(float)
-    low = low.astype(float)
-    close = close.astype(float)
-
-    tr = pd.concat([
-        (high - low).abs(),
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-
-    up_move = high - high.shift()
-    down_move = low.shift() - low
+    high = high.astype(float); low = low.astype(float); close = close.astype(float)
+    tr = pd.concat([(high - low).abs(), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    up_move = high - high.shift(); down_move = low.shift() - low
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-
     atr = tr.ewm(span=period, adjust=False).mean()
     plus_di = 100 * pd.Series(plus_dm, index=close.index).ewm(span=period, adjust=False).mean() / atr
     minus_di = 100 * pd.Series(minus_dm, index=close.index).ewm(span=period, adjust=False).mean() / atr
-
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
-    adx = dx.ewm(span=period, adjust=False).mean()
-    return adx
+    return dx.ewm(span=period, adjust=False).mean()
 
 
 # ============================================================
-# NEW v4.2: Spread Check
+# Spread Check
 # ============================================================
 
 def check_spread(conn: MetaApiConnection) -> tuple:
-    """
-    Check current XAUUSD spread.
-    Returns (ok: bool, spread_points: float, message: str)
-    """
     global last_spread_check
     try:
         price = conn.get_symbol_price(SYMBOL)
         if price and "bid" in price and "ask" in price:
             bid = price["bid"]
             ask = price["ask"]
-            spread_points = (ask - bid) * 100  # Convert to points (cents)
+            spread_points = (ask - bid) * 100
             last_spread_check = spread_points
-
             if spread_points > MAX_SPREAD_POINTS:
-                msg = f"[REJECTED] Spread too high: {spread_points:.1f} points (max: {MAX_SPREAD_POINTS})"
-                return False, spread_points, msg
-
+                return False, spread_points, f"[REJECTED] Spread too high: {spread_points:.1f} points (max: {MAX_SPREAD_POINTS})"
             return True, spread_points, f"Spread OK: {spread_points:.1f} points"
         return False, 0, "[REJECTED] Could not fetch spread data"
     except Exception as e:
@@ -275,44 +244,32 @@ def check_spread(conn: MetaApiConnection) -> tuple:
 
 
 # ============================================================
-# NEW v4.2: Economic Calendar / News Filter
+# News Filter
 # ============================================================
 
 def fetch_high_impact_events(conn: MetaApiConnection) -> list:
-    """
-    Fetch upcoming high-impact USD news events using MetaApi native calendar.
-    Falls back gracefully if unavailable.
-    """
     global cached_events, events_cache_time
     now = datetime.now(timezone.utc)
-
-    # Use cache if fresh
     if events_cache_time and (now - events_cache_time).total_seconds() < NEWS_CACHE_HOURS * 3600:
         return cached_events
-
     try:
-        # MetaApi SDK provides calendar via account_api.get_events()
         calendar = conn.api.metatrader_account_api
         future_events = conn._run(_async_get_calendar_events(conn, calendar))
-
         high_impact_usd = []
         for ev in future_events:
             country = str(getattr(ev, "country", "") or "").upper()
             impact = str(getattr(ev, "impact", "") or "").upper()
             event_time = getattr(ev, "time", None)
             title = str(getattr(ev, "title", "") or "")
-
             if country == "USD" and impact == "HIGH" and event_time:
                 ev_dt = event_time if isinstance(event_time, datetime) else datetime.fromisoformat(str(event_time))
                 if ev_dt.tzinfo is None:
                     ev_dt = ev_dt.replace(tzinfo=timezone.utc)
                 high_impact_usd.append({"time": ev_dt, "title": title})
-
         cached_events = high_impact_usd
         events_cache_time = now
         logger.info(f"[NEWS] Cached {len(high_impact_usd)} high-impact USD events")
         return high_impact_usd
-
     except Exception as e:
         logger.debug(f"[NEWS] Calendar fetch not available: {e}")
         cached_events = []
@@ -321,7 +278,6 @@ def fetch_high_impact_events(conn: MetaApiConnection) -> list:
 
 
 async def _async_get_calendar_events(conn, calendar_api):
-    """Async helper to fetch calendar events."""
     try:
         from datetime import timedelta as td
         start = datetime.now(timezone.utc)
@@ -333,45 +289,69 @@ async def _async_get_calendar_events(conn, calendar_api):
 
 
 def check_news_filter(conn: MetaApiConnection) -> tuple:
-    """
-    Check if we're in a high-impact news window.
-    Returns (ok: bool, next_event_minutes: float, message: str)
-    """
     try:
         events = fetch_high_impact_events(conn)
     except Exception:
         events = []
-
     if not events:
         return True, 999, "[NEWS] No high-impact events in window"
-
     now = datetime.now(timezone.utc)
     for ev in events:
         ev_time = ev["time"]
         mins_until = (ev_time - now).total_seconds() / 60.0
-
-        # Within 30 min BEFORE event → block
         if -15 <= mins_until <= NEWS_PAUSE_MINUTES_BEFORE:
             if mins_until > 0:
                 msg = f"[REJECTED] High-impact USD news in {mins_until:.0f} mins: {ev['title']}"
             else:
                 msg = f"[REJECTED] High-impact USD news event active: {ev['title']} (resume in {NEWS_RESUME_MINUTES_AFTER}min)"
             return False, mins_until, msg
-
-        # Within 15 min AFTER event → still block
         if -NEWS_RESUME_MINUTES_AFTER <= mins_until <= 0:
             msg = f"[REJECTED] Post-news cooldown ({-mins_until:.0f}/{NEWS_RESUME_MINUTES_AFTER}min): {ev['title']}"
             return False, mins_until, msg
-
     return True, 999, "[NEWS] Clear — no event conflict"
 
 
 # ============================================================
-# EXISTING: Startup Test
+# v4.3: Calculate lot size for 2% flat risk
+# ============================================================
+
+def calculate_lot_size(balance: float, sl_distance: float, conn: MetaApiConnection) -> float:
+    """
+    Calculate lot size to risk exactly 2% of balance.
+    Formula: Risk Amount = Balance * 0.02
+             Risk Per Lot = SL_Distance * 100 (XAUUSD contract size)
+             Lots = Risk Amount / Risk Per Lot
+    """
+    if sl_distance <= 0 or balance <= 0:
+        return 0.01  # Minimum safety
+
+    risk_amount = balance * 0.02  # 2% of balance
+    risk_per_lot = sl_distance * 100  # XAUUSD = 100 units per lot
+    raw_lot = risk_amount / risk_per_lot
+
+    # Clamp to broker limits (get symbol info from MetaApi)
+    try:
+        spec = conn.get_symbol_specification(SYMBOL)
+        vol_min = spec.get("volume_min", 0.01)
+        vol_max = spec.get("volume_max", 10.0)
+        vol_step = spec.get("volume_step", 0.01)
+    except:
+        vol_min, vol_max, vol_step = 0.01, 10.0, 0.01
+
+    # Round to step size
+    lot = round(raw_lot / vol_step) * vol_step
+    lot = max(vol_min, min(lot, vol_max))
+    lot = max(0.01, round(lot, 2))
+
+    logger.info(f"[RISK] Balance=${balance:.2f} RiskAmt=${risk_amount:.2f} SLdist=${sl_distance:.2f} RawLot={raw_lot:.4f} FinalLot={lot:.2f}")
+    return lot
+
+
+# ============================================================
+# Startup Test
 # ============================================================
 
 def startup_test(conn: MetaApiConnection):
-    """On bot startup, place a 0.01 BUY and close after 30 seconds."""
     global startup_test_done
     if startup_test_done:
         return
@@ -413,11 +393,10 @@ def startup_test(conn: MetaApiConnection):
 
 
 # ============================================================
-# EXISTING: Heartbeat Test
+# Heartbeat Test
 # ============================================================
 
 def heartbeat_test(conn: MetaApiConnection):
-    """Every HEARTBEAT_INTERVAL_MINUTES, place a 0.01 BUY and close after 30s."""
     global last_heartbeat_time
     now = datetime.now(timezone.utc)
     if last_heartbeat_time is not None:
@@ -462,7 +441,6 @@ def heartbeat_test(conn: MetaApiConnection):
 
 
 def fetch_live_data(conn: MetaApiConnection) -> dict:
-    """Fetch M5 + M15 candles (500 each) — matches backtest."""
     data = {}
     for tf in ["M5", "M15"]:
         df = get_candles(symbol=SYMBOL, timeframe=tf, count=500)
@@ -476,7 +454,6 @@ def fetch_live_data(conn: MetaApiConnection) -> dict:
 
 
 def safe_vol_filter(vf, m5_ohlcv, m15_ohlcv, m5_indicators, m15_indicators):
-    """Call vol_filter.analyze — same as backtest."""
     from trading_bot.utils.logger import logger as lg
     import logging
     old = lg.level; lg.setLevel(logging.ERROR)
@@ -495,26 +472,58 @@ def safe_vol_filter(vf, m5_ohlcv, m15_ohlcv, m5_indicators, m15_indicators):
 
 
 def update_paper_positions(current_price: float, atr_val: float):
-    """EXACT replication of backtest's update_positions logic."""
+    """v4.3: Now also calls modify_position() for LIVE breakeven on MetaApi."""
     global daily_pnl
     surviving = []
     for p in positions:
         e, d, sl, tp, lot = p["entry"], p["dir"], p["sl"], p["tp"], p["lot"]
         pv = lot * 100
-        # BE TRIGGER
+        pos_id = p.get("position_id", "")
+
+        # ======= v4.3: LIVE BREAKEVEN via modify_position() =======
+        if pos_id and pos_id not in be_modified_ids:
+            be_price = e + (atr_val * BE_ATR_MULT) if d == "BUY" else e - (atr_val * BE_ATR_MULT)
+            be_hit = (d == "BUY" and current_price >= be_price) or (d == "SELL" and current_price <= be_price)
+            if be_hit:
+                buffer = BE_BUFFER_POINTS * 0.01  # Convert points to price
+                new_sl = e + buffer if d == "BUY" else e - buffer
+                logger.info(f"[BREAKEVEN] Moving SL to {new_sl:.2f} for position {pos_id}")
+                try:
+                    result = modify_position(position_id=pos_id, sl=round(new_sl, 2), tp=tp)
+                    if result and result.get("success"):
+                        p["sl"] = round(new_sl, 2)
+                        p["be"] = True
+                        be_modified_ids.add(pos_id)
+                        logger.info(f"[BREAKEVEN] ✅ Position {pos_id} secured at {new_sl:.2f}")
+                    else:
+                        logger.warning(f"[BREAKEVEN] modify_position failed: {result}")
+                except Exception as ex:
+                    logger.warning(f"[BREAKEVEN] modify_position exception: {ex}")
+
+        # Original in-memory trailing SL
         if not p.get("be", False) and p.get("be_target"):
             if d == "BUY" and current_price >= p["be_target"]:
                 p["be"] = True; p["sl"] = e
             elif d == "SELL" and current_price <= p["be_target"]:
                 p["be"] = True; p["sl"] = e
-        # TRAILING SL
         if p.get("be"):
-            if d == "BUY":
-                ns = current_price - atr_val * TRAIL_ATR_MULT
-                if ns > sl + 0.5: p["sl"] = round(ns, 2)
-            else:
-                ns = current_price + atr_val * TRAIL_ATR_MULT
-                if ns < sl - 0.5: p["sl"] = round(ns, 2)
+            ns = current_price - atr_val * TRAIL_ATR_MULT if d == "BUY" else current_price + atr_val * TRAIL_ATR_MULT
+            if d == "BUY" and ns > sl + 0.5:
+                p["sl"] = round(ns, 2)
+                # Also update live SL on MetaApi
+                if pos_id:
+                    try:
+                        modify_position(position_id=pos_id, sl=round(ns, 2), tp=tp)
+                    except:
+                        pass
+            elif d == "SELL" and ns < sl - 0.5:
+                p["sl"] = round(ns, 2)
+                if pos_id:
+                    try:
+                        modify_position(position_id=pos_id, sl=round(ns, 2), tp=tp)
+                    except:
+                        pass
+
         sl, tp = p["sl"], p["tp"]
         hit, pnl, reason = False, 0.0, ""
         if d == "BUY":
@@ -533,6 +542,13 @@ def update_paper_positions(current_price: float, atr_val: float):
             p["pnl"] = pnl; p["reason"] = reason; p["close_price"] = current_price
             p["close_time"] = datetime.now(timezone.utc)
             trades_log.append(p)
+            # Close on MetaApi if we have a position ID
+            if pos_id and reason in ("TP", "SL", "TRAIL"):
+                try:
+                    close_position(position_id=pos_id)
+                    logger.info(f"[CLOSE] Position {pos_id} closed ({reason}) via MetaApi")
+                except Exception as ex:
+                    logger.warning(f"[CLOSE] close_position failed: {ex}")
             if reason == "SL":
                 record_loss()
             else:
@@ -543,7 +559,6 @@ def update_paper_positions(current_price: float, atr_val: float):
 
 
 def check_connection(conn: MetaApiConnection) -> bool:
-    """Check if connection is alive, reconnect if needed."""
     try:
         acc = conn.get_account_info()
         if acc and "balance" in acc:
@@ -559,10 +574,9 @@ def check_connection(conn: MetaApiConnection) -> bool:
 
 
 def v22_cycle(conn: MetaApiConnection):
-    """Single analysis + execution cycle with all filters (v4.2)."""
+    """v4.3: Now sends REAL MetaApi orders with execute_trade() for strategy trades."""
     global positions, last_entry, daily_pnl, last_processed_m15_time
 
-    # Check connection first
     if not check_connection(conn):
         logger.warning("Skipping cycle - no connection")
         return
@@ -574,14 +588,12 @@ def v22_cycle(conn: MetaApiConnection):
     if m5_df is None or m15_df is None or m5_df.empty or m15_df.empty:
         return
 
-    # Only act when a NEW M15 candle has closed
     last_m15_time = m15_df.index[-1]
     if last_processed_m15_time is not None and last_m15_time <= last_processed_m15_time:
         return
 
     now_utc = datetime.now(timezone.utc)
 
-    # Daily reset
     if last_date is None:
         last_date_today()
     if last_date is not None and last_date != now_utc.date():
@@ -593,12 +605,10 @@ def v22_cycle(conn: MetaApiConnection):
     if daily_pnl <= -STARTING_BALANCE * DAILY_LOSS_PCT:
         return
 
-    # SESSION FILTER
     if not is_in_trading_session(now_utc):
         last_processed_m15_time = last_m15_time
         return
 
-    # Match backtest window sizes exactly
     m15w = m15_df.tail(500).copy()
     m5u = m5_df[m5_df.index <= last_m15_time]
     m5w = m5u.tail(500).copy()
@@ -607,7 +617,6 @@ def v22_cycle(conn: MetaApiConnection):
         last_processed_m15_time = last_m15_time
         return
 
-    # INDICATORS
     try:
         m5_ind = compute_all_indicators(m5w)
         m15_ind = compute_all_indicators(m15w)
@@ -628,23 +637,17 @@ def v22_cycle(conn: MetaApiConnection):
         last_processed_m15_time = last_m15_time
         return
 
-    # Compute ADX for dynamic TP (v4.2)
+    # ADX for dynamic TP
     try:
         adx_series = compute_adx(m5w["high"], m5w["low"], m5w["close"], period=14)
         adx_val = float(adx_series.iloc[-1]) if not pd.isna(adx_series.iloc[-1]) else 0
     except Exception:
         adx_val = 0
 
-    # Dynamic TP based on ADX
-    if adx_val >= ADX_TREND_THRESHOLD:
-        tp_mult = TP_ATR_MULT_TREND
-        logger.info(f"[DYNAMIC TP] ADX={adx_val:.1f} > {ADX_TREND_THRESHOLD} → using {tp_mult}x ATR TP")
-    else:
-        tp_mult = TP_ATR_MULT
-
+    tp_mult = TP_ATR_MULT_TREND if adx_val >= ADX_TREND_THRESHOLD else TP_ATR_MULT
     current_price = float(m15w["close"].iloc[-1])
 
-    # UPDATE POSITIONS
+    # UPDATE POSITIONS — includes LIVE breakeven + trailing via MetaApi
     positions[:] = update_paper_positions(current_price, atr_val)
 
     if consecutive_losses >= HALT_AFTER_LOSSES and halt_until is None:
@@ -653,6 +656,7 @@ def v22_cycle(conn: MetaApiConnection):
         last_processed_m15_time = last_m15_time
         return
 
+    # Check if we already have a live position
     if len(positions) >= MAX_POSITIONS:
         last_processed_m15_time = last_m15_time
         save_state()
@@ -666,14 +670,14 @@ def v22_cycle(conn: MetaApiConnection):
         last_processed_m15_time = last_m15_time
         return
 
-    # === NEW v4.2: SPREAD FILTER ===
+    # SPREAD FILTER
     spread_ok, spread_pts, spread_msg = check_spread(conn)
     if not spread_ok:
         logger.warning(spread_msg)
         last_processed_m15_time = last_m15_time
         return
 
-    # === NEW v4.2: NEWS FILTER ===
+    # NEWS FILTER
     news_ok, news_mins, news_msg = check_news_filter(conn)
     if not news_ok:
         logger.warning(news_msg)
@@ -702,7 +706,7 @@ def v22_cycle(conn: MetaApiConnection):
         last_processed_m15_time = last_m15_time
         return
 
-    # RSI CONFLUENCE FILTER
+    # RSI CONFLUENCE
     try:
         rsi_bullish = m5_ind["rsi"].iloc[-1] > 40 and m15_ind["rsi"].iloc[-1] > 40
         rsi_bearish = m5_ind["rsi"].iloc[-1] < 60 and m15_ind["rsi"].iloc[-1] < 60
@@ -717,7 +721,7 @@ def v22_cycle(conn: MetaApiConnection):
     except Exception:
         pass
 
-    # SYMMETRIC EMA200 FILTER
+    # EMA200 FILTER
     closes = m15w["close"].values
     if len(closes) >= 200:
         ema200 = pd.Series(closes).ewm(200, adjust=False).mean().values
@@ -746,9 +750,9 @@ def v22_cycle(conn: MetaApiConnection):
     except Exception:
         pass
 
-    # ENTRY
+    # ======= v4.3: CALCULATE REAL SL/TP =======
     sl_dist = atr_val * SL_ATR_MULT
-    tp_dist = atr_val * tp_mult  # Dynamic: uses tp_mult from ADX check
+    tp_dist = atr_val * tp_mult
 
     if direction == "BUY":
         sl = round(current_price - sl_dist, 2)
@@ -757,34 +761,53 @@ def v22_cycle(conn: MetaApiConnection):
         sl = round(current_price + sl_dist, 2)
         tp = round(current_price - tp_dist, 2)
 
-    # Account info for lot sizing
+    # Get balance for risk calculation
     try:
         balance = conn.get_account_info()["balance"]
     except Exception:
         balance = 304.99
-    rp = get_risk_pct(balance)
-    lot = max(0.01, round(balance * (rp / 100) / (sl_dist * 100), 2))
-    lot = min(lot, 10.0)
+
+    # ======= v4.3: CALCULATE LOT SIZE (2% flat risk) =======
+    lot = calculate_lot_size(balance, sl_dist, conn)
 
     be_target = current_price + (atr_val * BE_ATR_MULT if direction == "BUY" else -atr_val * BE_ATR_MULT)
 
-    pos = {
-        "entry": current_price,
-        "sl": sl,
-        "tp": tp,
-        "lot": lot,
-        "dir": direction,
-        "open_time": last_m15_time.to_pydatetime() if hasattr(last_m15_time, 'to_pydatetime') else last_m15_time,
-        "score": score,
-        "be_target": be_target,
-        "be": False,
-    }
-    positions.append(pos)
-    last_entry = now_utc
+    # ======= v4.3: PLACE REAL METAPI ORDER =======
+    logger.info(f"[EXECUTE] Sending {direction} {lot} lots to MetaApi: SL={sl} TP={tp} (ADX={adx_val:.1f} {'TREND TP' if adx_val >= ADX_TREND_THRESHOLD else ''})")
 
-    logger.info(f"✅ V22 SIGNAL: {direction} score={score} lot={lot} SL={sl} TP={tp} atr={atr_val:.2f} adx={adx_val:.1f} spread={spread_pts:.1f}pts {'[TREND TP]' if adx_val >= ADX_TREND_THRESHOLD else ''}")
+    exec_result = execute_trade(
+        action=direction,
+        symbol=SYMBOL,
+        lot_size=lot,
+        sl=sl,
+        tp=tp,
+        ohlcv=pd.DataFrame(),
+        risk_evaluation={"approved": True, "adjusted_lot_scale": 1.0},
+    )
 
-    # Mark this M15 candle as processed
+    if exec_result and exec_result[0].get("success"):
+        order_id = exec_result[0].get("order_id", "")
+        logger.info(f"✅ V22 SIGNAL: {direction} score={score} lot={lot} SL={sl} TP={tp} atr={atr_val:.2f} adx={adx_val:.1f} spread={spread_pts:.1f}pts OrderID={order_id}")
+
+        # Track position with real MetaApi order ID
+        pos = {
+            "entry": current_price,
+            "sl": sl,
+            "tp": tp,
+            "lot": lot,
+            "dir": direction,
+            "open_time": last_m15_time.to_pydatetime() if hasattr(last_m15_time, 'to_pydatetime') else last_m15_time,
+            "score": score,
+            "be_target": be_target,
+            "be": False,
+            "position_id": order_id,  # v4.3: REAL MetaApi position ID
+        }
+        positions.append(pos)
+        last_entry = now_utc
+    else:
+        reason = exec_result[0].get("reason", "Unknown") if exec_result else "No result"
+        logger.error(f"[REJECTED] MetaApi order failed: {reason}")
+
     last_processed_m15_time = last_m15_time
     save_state()
 
@@ -801,14 +824,13 @@ def last_date_today():
 def run_v22():
     global last_date, STARTING_BALANCE
     logger.info("=" * 60)
-    logger.info("V22 GOLD SCALPING BOT — MetaApi Cloud (v4.2)")
-    logger.info("Dynamic Spread Filter + News Filter + ADX Dynamic TP")
+    logger.info("V22 GOLD SCALPING BOT — MetaApi Cloud (v4.3)")
+    logger.info("LIVE MetaApi orders | 2% Flat Risk | ADX Dynamic TP | Breakeven")
     logger.info("=" * 60)
-    logger.info(f"Config: MIN_SCORE={MIN_SCORE}, MAX_POS={MAX_POSITIONS}, TP={TP_ATR_MULT}x/{TP_ATR_MULT_TREND}x, SL={SL_ATR_MULT}x")
-    logger.info(f"Session: {TRADE_HOURS_START}:00-{TRADE_HOURS_END}:00 UTC (London+NY)")
-    logger.info(f"Spread max: {MAX_SPREAD_POINTS} points | ADX trend threshold: {ADX_TREND_THRESHOLD}")
-    logger.info(f"News filter: ~{NEWS_PAUSE_MINUTES_BEFORE}min before / {NEWS_RESUME_MINUTES_AFTER}min after high-impact USD")
-    logger.info(f"Halt: {HALT_AFTER_LOSSES} losses = {HALT_HOURS}h pause | Daily loss: {DAILY_LOSS_PCT*100}%")
+    logger.info(f"Config: MIN_SCORE={MIN_SCORE}, MAX_POS={MAX_POSITIONS}, Risk=2% flat")
+    logger.info(f"TP: {TP_ATR_MULT}x/{TP_ATR_MULT_TREND}x | SL: {SL_ATR_MULT}x")
+    logger.info(f"Spread max: {MAX_SPREAD_POINTS}pts | ADX threshold: {ADX_TREND_THRESHOLD}")
+    logger.info(f"Session: {TRADE_HOURS_START}:00-{TRADE_HOURS_END}:00 UTC")
     logger.info(f"Execution: {'ENABLED' if Config.EXECUTION_ENABLED else 'PAPER ONLY'}")
     logger.info("=" * 60)
 
@@ -837,7 +859,7 @@ def run_v22():
                 v22_cycle(conn)
 
             if cycle % 10 == 0:
-                logger.info(f"Cycle #{cycle} | Open: {len(positions)} | Losses: {consecutive_losses} | Trades: {len(trades_log)}")
+                logger.info(f"Cycle #{cycle} | Open: {len(positions)} | Losses: {consecutive_losses} | BE_ids: {len(be_modified_ids)} | Trades: {len(trades_log)}")
 
             try:
                 acc = conn.get_account_info()
