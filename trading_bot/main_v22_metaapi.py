@@ -315,6 +315,12 @@ def check_news_filter(conn: MetaApiConnection) -> tuple:
 # v4.3: Calculate lot size for 2% flat risk
 # ============================================================
 
+def get_dynamic_max_lot_size(balance: float) -> float:
+    """Safety cap: 0.1 lots per $100 of balance, clamped 0.01-10.0."""
+    cap = (balance / 100.0) * 0.1
+    return max(0.01, min(cap, 10.0))
+
+
 def calculate_lot_size(balance: float, sl_distance: float, conn: MetaApiConnection) -> float:
     """
     Calculate lot size to risk exactly 2% of balance.
@@ -342,6 +348,13 @@ def calculate_lot_size(balance: float, sl_distance: float, conn: MetaApiConnecti
     lot = round(raw_lot / vol_step) * vol_step
     lot = max(vol_min, min(lot, vol_max))
     lot = max(0.01, round(lot, 2))
+
+    # NEW: Dynamic safety cap based on balance
+    max_lot = get_dynamic_max_lot_size(balance)
+    if lot > max_lot:
+        logger.warning(f"[SAFETY] Capping trade size {lot:.4f} to {max_lot:.4f} for balance ${balance:.2f}")
+        lot = max_lot
+        lot = round(lot / vol_step) * vol_step
 
     logger.info(f"[RISK] Balance=${balance:.2f} RiskAmt=${risk_amount:.2f} SLdist=${sl_distance:.2f} RawLot={raw_lot:.4f} FinalLot={lot:.2f}")
     return lot
@@ -609,6 +622,12 @@ def v22_cycle(conn: MetaApiConnection):
         last_processed_m15_time = last_m15_time
         return
 
+    # FRIDAY ENTRY BLOCK: No new trades after 18:00 UTC on Friday
+    if now_utc.weekday() == 4 and now_utc.hour >= 18:
+        logger.info(f"[FRIDAY] Blocking entries - Friday {now_utc.hour}:00 UTC after 18:00 cutoff")
+        last_processed_m15_time = last_m15_time
+        return
+
     m15w = m15_df.tail(500).copy()
     m5u = m5_df[m5_df.index <= last_m15_time]
     m5w = m5u.tail(500).copy()
@@ -854,6 +873,18 @@ def run_v22():
 
             if not is_paused():
                 heartbeat_test(conn)
+
+            # FRIDAY AUTO-CLOSE: Close all positions at 21:00 UTC
+            if now_utc.weekday() == 4 and now_utc.hour >= 21:
+                for p in list(positions):
+                    pos_id = p.get("position_id", "")
+                    if pos_id:
+                        try:
+                            close_position(position_id=pos_id)
+                            logger.info(f"[FRIDAY] Auto-closing position {pos_id} at {now_utc.strftime('%H:%M UTC')}")
+                        except Exception as ex:
+                            logger.warning(f"[FRIDAY] close_position failed for {pos_id}: {ex}")
+                positions.clear()
 
             if not is_paused():
                 v22_cycle(conn)
