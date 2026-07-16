@@ -454,15 +454,28 @@ def heartbeat_test(conn: MetaApiConnection):
 
 
 def fetch_live_data(conn: MetaApiConnection) -> dict:
+    """Fetch M5 + M15 candles with error handling."""
     data = {}
     for tf in ["M5", "M15"]:
-        df = get_candles(symbol=SYMBOL, timeframe=tf, count=500)
+        try:
+            df = get_candles(symbol=SYMBOL, timeframe=tf, count=500)
+        except Exception as e:
+            logger.warning(f"[DATA] {tf} fetch failed ({e}), retrying with M15 fallback...")
+            df = None
         if df is None or df.empty:
             if tf == "M5":
-                df = get_candles(symbol=SYMBOL, timeframe="M15", count=500)
+                try:
+                    df = get_candles(symbol=SYMBOL, timeframe="M15", count=500)
+                except Exception as e:
+                    logger.warning(f"[DATA] M15 fallback also failed: {e}")
+                    return None
             else:
                 return None
-        data[tf] = df
+        try:
+            if not df.empty:
+                data[tf] = df
+        except:
+            return None
     return data
 
 
