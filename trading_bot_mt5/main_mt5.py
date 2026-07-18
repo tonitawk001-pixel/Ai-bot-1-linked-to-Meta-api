@@ -30,6 +30,9 @@ from mt5_connection import MT5Connection
 # Standalone logger (no project dependency needed)
 from logger_mt5 import logger
 
+# Telegram notifier
+import telegram_notifier as tg
+
 # Shared modules from main project
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -266,6 +269,14 @@ def main():
     atexit.register(mt5.shutdown)
     load_state()
     last_date = datetime.now(timezone.utc).date()
+    
+    # Telegram startup
+    log_text = "Telegram: Chat ID not set. Message @tonitawk_bot first."
+    if tg.try_auto_detect_chat_id():
+        log_text = "Telegram: Connected!"
+        tg.set_account_name(f"Acc_{mt5.get_account_info().get('login', '?')}")
+        tg.notify_startup()
+    logger.info(log_text)
 
     strategy = GoldScalpingStrategy()
     strategy._max_trades_per_day = 50
@@ -462,6 +473,9 @@ def main():
             if result and result.get("success"):
                 order_id = result.get("order_id", "")
                 logger.info(f"✅ ORDER EXECUTED: {direction} {lot} lots, ID: {order_id}")
+                
+                # Telegram notify
+                tg.notify_trade_opened(direction, SYMBOL, current_price, lot, sl, tp, score, balance)
 
                 pos = {
                     "entry": current_price,
