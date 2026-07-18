@@ -271,16 +271,18 @@ def main():
     last_date = datetime.now(timezone.utc).date()
     
     # Telegram startup
-    acc_name = f"Acc_{mt5.get_account_info().get('login', '?')}"
+    acc_info = mt5.get_account_info()
+    acc_name = f"Acc_{acc_info.get('login', '?')}"
+    acc_balance = acc_info.get('balance', 0) if acc_info else 0
     tg.set_account_name(acc_name)
     
     # If CHAT_ID is already hardcoded (not 0), send startup directly
     if tg.CHAT_ID:
-        tg.notify_startup()
+        tg.notify_startup(balance=acc_balance)
         logger.info("Telegram: Connected! Startup notification sent.")
     else:
         if tg.try_auto_detect_chat_id():
-            tg.notify_startup()
+            tg.notify_startup(balance=acc_balance)
             logger.info("Telegram: Auto-detected and connected!")
         else:
             logger.info("Telegram: Not configured. Message @Trading77777Bot first.")

@@ -71,13 +71,15 @@ def try_auto_detect_chat_id():
         pass
     return False
 
-def notify_startup():
-    """Send bot startup notification."""
+def notify_startup(balance=None):
+    """Send bot startup notification with optional balance."""
     msg = (
         f"🤖 <b>ACCOUNT: {ACCOUNT_NAME}</b>\n"
         f"🟢 <b>BOT STARTED</b>\n"
-        f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
+    if balance is not None:
+        msg += f"💰 <b>Balance:</b> ${balance:.2f}\n"
+    msg += f"⏰ {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     send_message(msg)
 
 def notify_shutdown():
