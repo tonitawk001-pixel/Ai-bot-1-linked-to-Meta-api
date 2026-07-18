@@ -4,8 +4,8 @@ Telegram Notifier Module
 Sends notifications to your Telegram bot about trades, errors, and heartbeat.
 
 Setup:
-1. Open Telegram, search @tonitawk_bot, send any message
-2. Edit config.py and set CHAT_ID
+1. Open Telegram, search @Trading77777Bot, send any message
+2. The bot auto-detects your Chat ID
 """
 
 import requests
