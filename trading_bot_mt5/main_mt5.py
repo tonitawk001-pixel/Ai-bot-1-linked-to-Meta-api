@@ -27,12 +27,14 @@ import numpy as np
 # Local MT5 connection
 from mt5_connection import MT5Connection
 
-# Strategy modules (shared from main project)
+# Standalone logger (no project dependency needed)
+from logger_mt5 import logger
+
+# Shared modules from main project
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from trading_bot.utils.logger import logger
 from trading_bot.indicators.technical_indicators import compute_all_indicators
 from trading_bot.strategy.gold_scalping_strategy import GoldScalpingStrategy
 
